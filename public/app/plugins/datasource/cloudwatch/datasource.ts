@@ -1,13 +1,14 @@
 import angular, { IQService } from 'angular';
 import _ from 'lodash';
+import appEvents from 'app/core/app_events';
 import { dateMath, ScopedVars, toDataFrame, TimeRange } from '@grafana/data';
 import kbn from 'app/core/utils/kbn';
 import { CloudWatchQuery } from './types';
+import { displayThrottlingError } from './errors';
 import { DataSourceApi, DataQueryRequest, DataSourceInstanceSettings } from '@grafana/ui';
 import { BackendSrv } from 'app/core/services/backend_srv';
 import { TemplateSrv } from 'app/features/templating/template_srv';
 import { TimeSrv } from 'app/features/dashboard/services/TimeSrv';
-// import * as moment from 'moment';
 
 export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery> {
   type: any;
@@ -20,7 +21,7 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
     private instanceSettings: DataSourceInstanceSettings,
     private $q: IQService,
     private backendSrv: BackendSrv,
-    private templateSrv: TemplateSrv,
+    public templateSrv: TemplateSrv,
     private timeSrv: TimeSrv
   ) {
     super(instanceSettings);
@@ -33,7 +34,6 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
 
   query(options: DataQueryRequest<CloudWatchQuery>) {
     options = angular.copy(options);
-    options.targets = this.expandTemplateVariable(options.targets, options.scopedVars, this.templateSrv);
 
     const queries = _.filter(options.targets, item => {
       return (
@@ -142,30 +142,51 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
   }
 
   buildCloudwatchConsoleUrl(
-    { region, namespace, metricName, dimensions, statistics, period }: CloudWatchQuery,
+    { region, namespace, metricName, dimensions, statistics, period, expression }: CloudWatchQuery,
     start: string,
     end: string,
-    title: string
+    title: string,
+    searchExpressions: string[]
   ) {
-    const conf = {
+    let conf = {
       view: 'timeSeries',
       stacked: false,
       title,
       start,
       end,
       region,
-      metrics: [
-        ...statistics.map(stat => [
-          namespace,
-          metricName,
-          ...Object.entries(dimensions).reduce((acc, [key, value]) => [...acc, key, value], []),
-          {
-            stat,
-            period,
-          },
-        ]),
-      ],
-    };
+    } as any;
+
+    const isSearchExpression =
+      (searchExpressions && searchExpressions.length) || (statistics.length <= 1 && /SEARCH().*/.test(expression));
+    const isMathExpression = !isSearchExpression && expression;
+
+    if (isMathExpression) {
+      return '';
+    }
+
+    if (isSearchExpression) {
+      const metrics: any =
+        searchExpressions && searchExpressions.length
+          ? searchExpressions.map(expression => ({ expression }))
+          : [{ expression }];
+      conf = { ...conf, metrics };
+    } else {
+      conf = {
+        ...conf,
+        metrics: [
+          ...statistics.map(stat => [
+            namespace,
+            metricName,
+            ...Object.entries(dimensions).reduce((acc, [key, value]) => [...acc, key, value[0]], []),
+            {
+              stat,
+              period,
+            },
+          ]),
+        ],
+      };
+    }
 
     return `https://${region}.console.aws.amazon.com/cloudwatch/deeplink.js?region=${region}#metricsV2:graph=${encodeURIComponent(
       JSON.stringify(conf)
@@ -173,44 +194,58 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
   }
 
   performTimeSeriesQuery(request: any, { from, to }: TimeRange) {
-    return this.awsRequest('/api/tsdb/query', request).then((res: any) => {
-      if (!res.results) {
-        return { data: [] };
-      }
-      const dataFrames = Object.values(request.queries).reduce((acc: any, queryRequest: any) => {
-        const queryResult = res.results[queryRequest.refId];
-        if (!queryResult) {
-          return acc;
+    return this.awsRequest('/api/tsdb/query', request)
+      .then((res: any) => {
+        if (!res.results) {
+          return { data: [] };
+        }
+        const dataFrames = Object.values(request.queries).reduce((acc: any, queryRequest: any) => {
+          const queryResult = res.results[queryRequest.refId];
+          if (!queryResult) {
+            return acc;
+          }
+
+          const link = this.buildCloudwatchConsoleUrl(
+            queryRequest,
+            from.toISOString(),
+            to.toISOString(),
+            queryRequest.refId,
+            queryResult.meta.searchExpressions
+          );
+
+          return [
+            ...acc,
+            ...queryResult.series.map(({ name, points }: any) => {
+              const dataFrame = toDataFrame({ target: name, datapoints: points });
+              if (link) {
+                for (const field of dataFrame.fields) {
+                  field.config.links = [
+                    {
+                      url: link,
+                      title: 'View in CloudWatch console',
+                      targetBlank: true,
+                    },
+                  ];
+                }
+              }
+              return dataFrame;
+            }),
+          ];
+        }, []);
+
+        return { data: dataFrames };
+      })
+      .catch((err: any = { data: { error: '' } }) => {
+        console.log({ supererror: err });
+        if (/^ValidationError:.*/.test(err.data.error)) {
+          appEvents.emit('ds-request-error', err.data.error);
         }
 
-        const link = this.buildCloudwatchConsoleUrl(
-          queryRequest,
-          from.toISOString(),
-          to.toISOString(),
-          `query${queryRequest.refId}`
-        );
-
-        return [
-          ...acc,
-          ...queryResult.series.map(({ name, points, meta }: any) => {
-            const series = { target: name, datapoints: points };
-            const dataFrame = toDataFrame(meta && meta.unit ? { ...series, unit: meta.unit } : series);
-            for (const field of dataFrame.fields) {
-              field.config.links = [
-                {
-                  url: link,
-                  title: 'View in CloudWatch console',
-                  targetBlank: true,
-                },
-              ];
-            }
-            return dataFrame;
-          }),
-        ];
-      }, []);
-
-      return { data: dataFrames };
-    });
+        if (/^Throttling:.*/.test(err.data.error)) {
+          displayThrottlingError();
+        }
+        throw err;
+      });
   }
 
   transformSuggestDataFromTable(suggestData: any) {
@@ -472,68 +507,6 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
     return region;
   }
 
-  getExpandedVariables(target: any, dimensionKey: any, variable: any, templateSrv: TemplateSrv) {
-    /* if the all checkbox is marked we should add all values to the targets */
-    const allSelected: any = _.find(variable.options, { selected: true, text: 'All' });
-    const selectedVariables = _.filter(variable.options, v => {
-      if (allSelected) {
-        return v.text !== 'All';
-      } else {
-        return v.selected;
-      }
-    });
-    const currentVariables = !_.isArray(variable.current.value)
-      ? [variable.current]
-      : variable.current.value.map((v: any) => {
-          return {
-            text: v,
-            value: v,
-          };
-        });
-    const useSelectedVariables =
-      selectedVariables.some((s: any) => {
-        return s.value === currentVariables[0].value;
-      }) || currentVariables[0].value === '$__all';
-    return (useSelectedVariables ? selectedVariables : currentVariables).map((v: any) => {
-      const t = angular.copy(target);
-      const scopedVar: any = {};
-      scopedVar[variable.name] = v;
-      t.refId = target.refId + '_' + v.value;
-      t.dimensions[dimensionKey] = templateSrv.replace(t.dimensions[dimensionKey], scopedVar);
-      if (variable.multi && target.id) {
-        t.id = target.id + window.btoa(v.value).replace(/=/g, '0'); // generate unique id
-      } else {
-        t.id = target.id;
-      }
-      return t;
-    });
-  }
-
-  expandTemplateVariable(targets: any, scopedVars: ScopedVars, templateSrv: TemplateSrv) {
-    // Datasource and template srv logic uber-complected. This should be cleaned up.
-    return _.chain(targets)
-      .map(target => {
-        if (target.id && target.id.length > 0 && target.expression && target.expression.length > 0) {
-          return [target];
-        }
-
-        const variableIndex = _.keyBy(templateSrv.variables, 'name');
-        const dimensionKey = _.findKey(target.dimensions, v => {
-          const variableName = templateSrv.getVariableName(v);
-          return templateSrv.variableExists(v) && !_.has(scopedVars, variableName) && variableIndex[variableName].multi;
-        });
-
-        if (dimensionKey) {
-          const multiVariable = variableIndex[templateSrv.getVariableName(target.dimensions[dimensionKey])];
-          return this.getExpandedVariables(target, dimensionKey, multiVariable, templateSrv);
-        } else {
-          return [target];
-        }
-      })
-      .flatten()
-      .value();
-  }
-
   convertToCloudWatchTime(date: any, roundUp: any) {
     if (_.isString(date)) {
       date = dateMath.parse(date, roundUp);
@@ -541,11 +514,24 @@ export default class CloudWatchDatasource extends DataSourceApi<CloudWatchQuery>
     return Math.round(date.valueOf() / 1000);
   }
 
-  convertDimensionFormat(dimensions: any, scopedVars: ScopedVars) {
-    const convertedDimensions: any = {};
-    _.each(dimensions, (value, key) => {
-      convertedDimensions[this.templateSrv.replace(key, scopedVars)] = this.templateSrv.replace(value, scopedVars);
-    });
-    return convertedDimensions;
+  convertDimensionFormat(dimensions: { [key: string]: string | string[] }, scopedVars: ScopedVars) {
+    return Object.entries(dimensions).reduce((result, [key, value]) => {
+      if (Array.isArray(value)) {
+        return { ...result, [key]: value };
+      }
+
+      const variable = this.templateSrv.variables.find(
+        variable => variable.name === this.templateSrv.getVariableName(value)
+      );
+      if (variable) {
+        if (variable.multi) {
+          const values = this.templateSrv.replace(value, scopedVars, 'pipe').split('|');
+          return { ...result, [key]: values };
+        }
+        return { ...result, [key]: [this.templateSrv.replace(value, scopedVars)] };
+      }
+
+      return { ...result, [key]: [value] };
+    }, {});
   }
 }

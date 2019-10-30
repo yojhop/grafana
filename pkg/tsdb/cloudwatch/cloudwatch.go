@@ -2,10 +2,7 @@ package cloudwatch
 
 import (
 	"context"
-	"fmt"
 	"regexp"
-	"strconv"
-	"strings"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
@@ -18,6 +15,7 @@ import (
 
 type CloudWatchExecutor struct {
 	*models.DataSource
+	mdpb    *metricDataParamBuilder
 	ec2Svc  ec2iface.EC2API
 	rgtaSvc resourcegroupstaggingapiiface.ResourceGroupsTaggingAPIAPI
 }
@@ -33,8 +31,14 @@ type DatasourceInfo struct {
 	SecretKey string
 }
 
+const (
+	maxNoOfSearchExpressions = 5
+	maxNoOfMetricDataQueries = 100
+)
+
 func NewCloudWatchExecutor(dsInfo *models.DataSource) (tsdb.TsdbQueryEndpoint, error) {
-	return &CloudWatchExecutor{}, nil
+	mdpb := &metricDataParamBuilder{maxNoOfSearchExpressions, maxNoOfMetricDataQueries}
+	return &CloudWatchExecutor{mdpb: mdpb}, nil
 }
 
 var (
@@ -80,74 +84,42 @@ func (e *CloudWatchExecutor) executeTimeSeriesQuery(ctx context.Context, queryCo
 	results := &tsdb.Response{
 		Results: make(map[string]*tsdb.QueryResult),
 	}
-	resultChan := make(chan *tsdb.QueryResult, len(queryContext.Queries))
 
-	eg, ectx := errgroup.WithContext(ctx)
-
-	getMetricDataQueries := make(map[string]map[string]*CloudWatchQuery)
-	for i, model := range queryContext.Queries {
-		queryType := model.Model.Get("type").MustString()
-		if queryType != "timeSeriesQuery" && queryType != "" {
-			continue
-		}
-
-		RefId := queryContext.Queries[i].RefId
-		query, err := parseQuery(queryContext.Queries[i].Model)
-		if err != nil {
-			results.Results[RefId] = &tsdb.QueryResult{
-				Error: err,
-			}
-			return results, nil
-		}
-		query.RefId = RefId
-
-		if query.Id != "" {
-			if _, ok := getMetricDataQueries[query.Region]; !ok {
-				getMetricDataQueries[query.Region] = make(map[string]*CloudWatchQuery)
-			}
-			getMetricDataQueries[query.Region][query.Id] = query
-			continue
-		}
-
-		if query.Id == "" && query.Expression != "" {
-			results.Results[query.RefId] = &tsdb.QueryResult{
-				Error: fmt.Errorf("Invalid query: id should be set if using expression"),
-			}
-			return results, nil
-		}
-
-		eg.Go(func() error {
-			defer func() {
-				if err := recover(); err != nil {
-					plog.Error("Execute Query Panic", "error", err, "stack", log.Stack(1))
-					if theErr, ok := err.(error); ok {
-						resultChan <- &tsdb.QueryResult{
-							RefId: query.RefId,
-							Error: theErr,
-						}
-					}
-				}
-			}()
-
-			queryRes, err := e.executeQuery(ectx, query, queryContext)
-			if ae, ok := err.(awserr.Error); ok && ae.Code() == "500" {
-				return err
-			}
-			if err != nil {
-				resultChan <- &tsdb.QueryResult{
-					RefId: query.RefId,
-					Error: err,
-				}
-				return nil
-			}
-			resultChan <- queryRes
-			return nil
-		})
+	requestQueries, err := e.parseQueries(queryContext)
+	if err != nil {
+		return results, err
 	}
 
-	if len(getMetricDataQueries) > 0 {
-		for region, getMetricDataQuery := range getMetricDataQueries {
-			q := getMetricDataQuery
+	queries, err := e.transformRequestQueriesToCloudWatchQueries(requestQueries)
+	if err != nil {
+		return results, err
+	}
+
+	queriesByRegion := e.groupQueriesByRegion(queries)
+
+	metricDataParamsByRegion := make(map[string][]*metricDataParam)
+	for region, queries := range queriesByRegion {
+		metricDataParams, err := e.mdpb.build(queryContext, queries)
+		if err != nil {
+			if e, ok := err.(*queryBuilderError); ok {
+				results.Results[e.RefID] = &tsdb.QueryResult{
+					Error: err,
+				}
+				return results, nil
+			}
+
+			return results, err
+		}
+		metricDataParamsByRegion[region] = metricDataParams
+	}
+
+	resultChan := make(chan *tsdb.QueryResult, len(queryContext.Queries))
+	eg, ectx := errgroup.WithContext(ctx)
+
+	if len(metricDataParamsByRegion) > 0 {
+		for region, metricDataParams := range metricDataParamsByRegion {
+			mdps := metricDataParams
+			r := region
 			eg.Go(func() error {
 				defer func() {
 					if err := recover(); err != nil {
@@ -160,14 +132,43 @@ func (e *CloudWatchExecutor) executeTimeSeriesQuery(ctx context.Context, queryCo
 					}
 				}()
 
-				queryResponses, err := e.executeGetMetricDataQuery(ectx, region, q, queryContext)
-				if ae, ok := err.(awserr.Error); ok && ae.Code() == "500" {
+				client, err := e.getClient(r)
+				if err != nil {
 					return err
 				}
-				for _, queryRes := range queryResponses {
+
+				cloudwatchResponses := make([]*cloudwatchResponse, 0)
+				for _, mdp := range mdps {
+					mdo, err := e.executeRequest(ectx, client, mdp.MetricDataInput)
 					if err != nil {
-						queryRes.Error = err
+						if ae, ok := err.(awserr.Error); ok && ae.Code() == "Throttling" {
+							refIds := mdp.getUniqueRefIDs()
+							for _, refID := range refIds {
+								resultChan <- &tsdb.QueryResult{
+									RefId: refID,
+									Error: ae,
+								}
+							}
+						} else {
+							return err
+						}
+					} else {
+						responses, err := e.parseResponse(mdo, mdp.groupQueriesByID())
+						if err != nil {
+							for _, refID := range mdp.getUniqueRefIDs() {
+								resultChan <- &tsdb.QueryResult{
+									RefId: refID,
+									Error: err,
+								}
+							}
+						}
+						cloudwatchResponses = append(cloudwatchResponses, responses...)
 					}
+				}
+
+				res := e.transformQueryResponseToQueryResult(cloudwatchResponses)
+
+				for _, queryRes := range res {
 					resultChan <- queryRes
 				}
 				return nil
@@ -186,51 +187,15 @@ func (e *CloudWatchExecutor) executeTimeSeriesQuery(ctx context.Context, queryCo
 	return results, nil
 }
 
-func formatAlias(query *CloudWatchQuery, stat string, dimensions map[string]string, label string) string {
-	region := query.Region
-	namespace := query.Namespace
-	metricName := query.MetricName
-	period := strconv.Itoa(query.Period)
-	if len(query.Id) > 0 && len(query.Expression) > 0 {
-		if strings.Index(query.Expression, "SEARCH(") == 0 {
-			pIndex := strings.LastIndex(query.Expression, ",")
-			period = strings.Trim(query.Expression[pIndex+1:], " )")
-			sIndex := strings.LastIndex(query.Expression[:pIndex], ",")
-			stat = strings.Trim(query.Expression[sIndex+1:pIndex], " '")
-		} else if len(query.Alias) > 0 {
-			// expand by Alias
-		} else {
-			return query.Id
+func (e *CloudWatchExecutor) groupQueriesByRegion(queries map[string]*cloudWatchQuery) map[string][]*cloudWatchQuery {
+	queriesByRegion := make(map[string][]*cloudWatchQuery)
+
+	for _, query := range queries {
+		if _, ok := queriesByRegion[query.Region]; !ok {
+			queriesByRegion[query.Region] = make([]*cloudWatchQuery, 0)
 		}
+		queriesByRegion[query.Region] = append(queriesByRegion[query.Region], query)
 	}
 
-	data := map[string]string{}
-	data["region"] = region
-	data["namespace"] = namespace
-	data["metric"] = metricName
-	data["stat"] = stat
-	data["period"] = period
-	if len(label) != 0 {
-		data["label"] = label
-	}
-	for k, v := range dimensions {
-		data[k] = v
-	}
-
-	result := aliasFormat.ReplaceAllFunc([]byte(query.Alias), func(in []byte) []byte {
-		labelName := strings.Replace(string(in), "{{", "", 1)
-		labelName = strings.Replace(labelName, "}}", "", 1)
-		labelName = strings.TrimSpace(labelName)
-		if val, exists := data[labelName]; exists {
-			return []byte(val)
-		}
-
-		return in
-	})
-
-	if string(result) == "" {
-		return metricName + "_" + stat
-	}
-
-	return string(result)
+	return queriesByRegion
 }
