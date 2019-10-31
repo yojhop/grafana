@@ -54,6 +54,14 @@ export class CloudWatchQueryEditor extends PureComponent<Props, State> {
     if (!query.hasOwnProperty('matchExact')) {
       query.matchExact = true;
     }
+
+    if (!query.region) {
+      query.region = 'default';
+    }
+
+    if (!query.statistics.length) {
+      query.statistics = ['Average'];
+    }
   }
 
   componentDidMount() {
@@ -174,7 +182,7 @@ export class CloudWatchQueryEditor extends PureComponent<Props, State> {
           </>
         )}
 
-        {query.statistics.length === 1 && (
+        {query.statistics.length <= 1 && (
           <div className="gf-form-inline">
             <div className="gf-form">
               <FormField
