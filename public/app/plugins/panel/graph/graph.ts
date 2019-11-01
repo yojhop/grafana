@@ -81,7 +81,7 @@ class GraphElement {
     appEvents.on('graph-hover', this.onGraphHover.bind(this), scope);
     appEvents.on('graph-hover-clear', this.onGraphHoverClear.bind(this), scope);
     this.elem.bind('plotselected', this.onPlotSelected.bind(this));
-    this.elem.bind('plotclick', this.onPlotClick.bind(this));
+    //this.elem.bind('plotclick', this.onPlotClick.bind(this));
 
     // get graph legend element
     if (this.elem && this.elem.parent) {
@@ -192,7 +192,7 @@ class GraphElement {
         {
           items: [
             {
-              label: 'Add annotation',
+              label: 'Add annotation 5',
               icon: 'gicon gicon-annotation',
               onClick: () => this.eventManager.updateTime({ from: flotPosition.x, to: null }),
             },
