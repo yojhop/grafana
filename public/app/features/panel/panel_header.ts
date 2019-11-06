@@ -1,5 +1,5 @@
 import { coreModule } from 'app/core/core';
-import { AngularPanelMenuItem } from '@grafana/ui';
+import { AngularPanelMenuItem } from '@grafana/data';
 
 const template = `
 <span class="panel-title">
@@ -12,7 +12,14 @@ const template = `
   </span>
   <span class="panel-time-info" ng-if="ctrl.timeInfo"><i class="fa fa-clock-o"></i> {{ctrl.timeInfo}}</span>
 </span>`;
-
+if ( /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ) {
+  window.addEventListener('mouseup',  (event)=> {
+    event.stopPropagation();
+  },true);
+  window.addEventListener('touchend',  (event)=> {
+    event.stopPropagation();
+  },true);
+ }
 function renderMenuItem(item: AngularPanelMenuItem, ctrl: any) {
   let html = '';
   let listItemClass = '';
